@@ -51,8 +51,19 @@ use std::time::Duration;
 use xattrmap::{AppliedRule, XattrMap};
 
 const EMPTY_CSTR: &[u8] = b"\0";
+const POSIX_ACL_ACCESS_XATTR: &[u8] = b"system.posix_acl_access";
 
 type Handle = u64;
+
+fn should_clear_sgid_for_setxattr(
+    posix_acl: bool,
+    extra_flags: SetxattrFlags,
+    name: &CStr,
+) -> bool {
+    posix_acl
+        && extra_flags.contains(SetxattrFlags::SETXATTR_ACL_KILL_SGID)
+        && name.to_bytes() == POSIX_ACL_ACCESS_XATTR
+}
 
 enum HandleDataFile {
     File(RwLock<GuestFile>),
@@ -2352,10 +2363,11 @@ impl FileSystem for PassthroughFs {
 
         // If we are setting posix access acl and if SGID needs to be
         // cleared. Let's do it explicitly by calling a chmod() syscall.
-        let xattr_name = name.as_ref().to_str().unwrap();
-        let must_clear_sgid = self.posix_acl.load(Ordering::Relaxed)
-            && extra_flags.contains(SetxattrFlags::SETXATTR_ACL_KILL_SGID)
-            && xattr_name.eq("system.posix_acl_access");
+        let must_clear_sgid = should_clear_sgid_for_setxattr(
+            self.posix_acl.load(Ordering::Relaxed),
+            extra_flags,
+            name.as_ref(),
+        );
 
         let res = if is_safe_inode(data.mode) {
             // The f{set,get,remove,list}xattr functions don't work on an fd opened with `O_PATH` so we
@@ -2684,5 +2696,32 @@ impl HandleDataFile {
 impl From<GuestFile> for HandleDataFile {
     fn from(file: GuestFile) -> Self {
         HandleDataFile::File(RwLock::new(file))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn setxattr_non_utf8_name_does_not_clear_sgid() {
+        let name = CStr::from_bytes_with_nul(b"user.\xff\0").unwrap();
+
+        assert!(!should_clear_sgid_for_setxattr(
+            true,
+            SetxattrFlags::SETXATTR_ACL_KILL_SGID,
+            name,
+        ));
+    }
+
+    #[test]
+    fn setxattr_posix_acl_access_clears_sgid() {
+        let name = CStr::from_bytes_with_nul(b"system.posix_acl_access\0").unwrap();
+
+        assert!(should_clear_sgid_for_setxattr(
+            true,
+            SetxattrFlags::SETXATTR_ACL_KILL_SGID,
+            name,
+        ));
     }
 }
