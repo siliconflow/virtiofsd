@@ -624,9 +624,7 @@ impl PassthroughFs {
             .ok_or_else(ebadf)
     }
 
-    fn open_inode(&self, inode: Inode, mut flags: i32) -> io::Result<File> {
-        let data = self.inodes.get(inode).ok_or_else(ebadf)?;
-
+    fn open_inode(&self, data: &InodeData, mut flags: i32) -> io::Result<File> {
         // When writeback caching is enabled, the kernel may send read requests even if the
         // userspace program opened the file write-only. So we need to ensure that we have opened
         // the file for reading as well as writing.
@@ -953,13 +951,14 @@ impl PassthroughFs {
             flags &= !(libc::O_NOATIME as u32)
         }
 
+        let inode_data = self.inodes.get(inode).ok_or_else(ebadf)?;
         let file = {
             let _killpriv_guard = if self.cfg.killpriv_v2 && kill_priv {
                 drop_effective_cap("FSETID")?
             } else {
                 None
             };
-            self.open_inode(inode, flags as i32)?
+            self.open_inode(&inode_data, flags as i32)?
         };
 
         if flags & (libc::O_TRUNC as u32) != 0 {
@@ -2372,7 +2371,7 @@ impl FileSystem for PassthroughFs {
         let res = if is_safe_inode(data.mode) {
             // The f{set,get,remove,list}xattr functions don't work on an fd opened with `O_PATH` so we
             // need to get a new fd.
-            let file = self.open_inode(inode, libc::O_RDONLY | libc::O_NONBLOCK)?;
+            let file = self.open_inode(&data, libc::O_RDONLY | libc::O_NONBLOCK)?;
 
             self.clear_file_capabilities(file.as_raw_fd(), false)?;
 
@@ -2448,7 +2447,7 @@ impl FileSystem for PassthroughFs {
         let res = if is_safe_inode(data.mode) {
             // The f{set,get,remove,list}xattr functions don't work on an fd opened with `O_PATH` so we
             // need to get a new fd.
-            let file = self.open_inode(inode, libc::O_RDONLY | libc::O_NONBLOCK)?;
+            let file = self.open_inode(&data, libc::O_RDONLY | libc::O_NONBLOCK)?;
 
             // Safe because this will only modify the contents of `buf`.
             unsafe {
@@ -2500,7 +2499,7 @@ impl FileSystem for PassthroughFs {
         let res = if is_safe_inode(data.mode) {
             // The f{set,get,remove,list}xattr functions don't work on an fd opened with `O_PATH` so we
             // need to get a new fd.
-            let file = self.open_inode(inode, libc::O_RDONLY | libc::O_NONBLOCK)?;
+            let file = self.open_inode(&data, libc::O_RDONLY | libc::O_NONBLOCK)?;
 
             // Safe because this will only modify the contents of `buf`.
             unsafe {
@@ -2551,7 +2550,7 @@ impl FileSystem for PassthroughFs {
         let res = if is_safe_inode(data.mode) {
             // The f{set,get,remove,list}xattr functions don't work on an fd opened with `O_PATH` so we
             // need to get a new fd.
-            let file = self.open_inode(inode, libc::O_RDONLY | libc::O_NONBLOCK)?;
+            let file = self.open_inode(&data, libc::O_RDONLY | libc::O_NONBLOCK)?;
 
             // Safe because this doesn't modify any memory and we check the return value.
             unsafe { libc::fremovexattr(file.as_raw_fd(), name.as_ptr()) }
@@ -2668,7 +2667,8 @@ impl FileSystem for PassthroughFs {
     fn syncfs(&self, _ctx: Context, inode: Inode) -> io::Result<()> {
         // TODO: Branch here depending on whether virtiofsd announces submounts or not.
 
-        let file = self.open_inode(inode, libc::O_RDONLY | libc::O_NOFOLLOW)?;
+        let data = self.inodes.get(inode).ok_or_else(ebadf)?;
+        let file = self.open_inode(&data, libc::O_RDONLY | libc::O_NOFOLLOW)?;
         let raw_fd = file.as_raw_fd();
         debug!("syncfs: inode={inode}, mount_fd={raw_fd}");
         let ret = unsafe { libc::syncfs(raw_fd) };
