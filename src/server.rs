@@ -994,13 +994,10 @@ impl<F: FileSystem + Sync> Server<F> {
             fh, offset, size, ..
         } = r.read_obj().map_err(Error::DecodeMessage)?;
 
-        if size > MAX_BUFFER_SIZE {
-            return reply_error(
-                io::Error::from_raw_os_error(libc::ENOMEM),
-                in_header.unique,
-                w,
-            );
-        }
+        // READDIR may return less than requested. Limit the amount of
+        // directory data generated locally instead of rejecting a larger
+        // output buffer.
+        let size = size.min(MAX_BUFFER_SIZE);
 
         let available_bytes = w.available_bytes();
         if available_bytes < size as usize {
@@ -1088,13 +1085,10 @@ impl<F: FileSystem + Sync> Server<F> {
             fh, offset, size, ..
         } = r.read_obj().map_err(Error::DecodeMessage)?;
 
-        if size > MAX_BUFFER_SIZE {
-            return reply_error(
-                io::Error::from_raw_os_error(libc::ENOMEM),
-                in_header.unique,
-                w,
-            );
-        }
+        // READDIRPLUS may return less than requested. Limit the amount of
+        // directory data generated locally instead of rejecting a larger
+        // output buffer.
+        let size = size.min(MAX_BUFFER_SIZE);
 
         let available_bytes = w.available_bytes();
         if available_bytes < size as usize {
