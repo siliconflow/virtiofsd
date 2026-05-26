@@ -72,9 +72,26 @@ enum HandleDataFile {
     Invalid(Arc<io::Error>),
 }
 
+#[allow(unused)]
+#[derive(Copy, Clone, Debug)]
+struct FileType(u32);
+
+impl FileType {
+    fn from_mode(mode: u32) -> Self {
+        FileType(mode & libc::S_IFMT)
+    }
+
+    #[allow(unused)]
+    fn is_regular_file(&self) -> bool {
+        self.0 == libc::S_IFREG
+    }
+}
+
 struct HandleData {
     inode: Inode,
     file: HandleDataFile,
+    #[allow(unused)]
+    file_type: FileType,
 
     // On migration, must be set when we serialize our internal state to send it to the
     // destination.  As long as `HandleMigrationInfo::new()` is cheap, we may as well
@@ -986,6 +1003,7 @@ impl PassthroughFs {
         }
 
         let inode_data = self.inodes.get(inode).ok_or_else(ebadf)?;
+        let file_type = FileType::from_mode(inode_data.mode);
         let file = {
             let _killpriv_guard = if self.cfg.killpriv_v2 && kill_priv {
                 drop_effective_cap("FSETID")?
@@ -1003,6 +1021,7 @@ impl PassthroughFs {
         let data = HandleData {
             inode,
             file: self.guest_fds.allocate(file)?.into(),
+            file_type,
             migration_info: HandleMigrationInfo::new(flags as i32),
         };
 
@@ -1827,6 +1846,7 @@ impl FileSystem for PassthroughFs {
                 let data = HandleData {
                     inode: entry.inode,
                     file: self.guest_fds.allocate(file)?.into(),
+                    file_type: FileType::from_mode(mode),
                     migration_info: HandleMigrationInfo::new(flags as i32),
                 };
 
