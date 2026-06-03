@@ -9,6 +9,8 @@ use std::mem::size_of;
 use std::ops::{Deref, DerefMut};
 use std::os::unix::io::AsRawFd;
 
+use log::debug;
+
 use vm_memory::ByteValued;
 
 #[repr(C, packed)]
@@ -29,15 +31,72 @@ pub struct ReadDir<P> {
 }
 
 impl<P: DerefMut<Target = [u8]>> ReadDir<P> {
-    pub fn new<D: AsRawFd>(dir: &D, offset: libc::off64_t, buf: P) -> io::Result<Self> {
-        // Safe because this doesn't modify any memory and we check the return value.
-        let res = unsafe { libc::lseek64(dir.as_raw_fd(), offset, libc::SEEK_SET) };
+    /// Seek to `offset` in the directory and read a batch of entries.
+    ///
+    /// For offsets that exceed `i64::MAX` (e.g., AWS EFS cookies with the
+    /// high bit set), the `u64`-to-`off64_t` cast produces a negative value,
+    /// which the kernel rejects. In that case we fall back to scan from the
+    /// beginning and move forward to the target cookie.
+    pub fn new<D: AsRawFd>(dir: &D, offset: u64, buf: P) -> io::Result<Self> {
+        // SAFETY: Safe because this doesn't modify any memory and we check the return value.
+        // The possible wrapping of the `u64` to `i64` cast is intended.
+        let res =
+            unsafe { libc::lseek64(dir.as_raw_fd(), offset as libc::off64_t, libc::SEEK_SET) };
+        if res >= 0 {
+            return unsafe { Self::new_no_seek(dir, buf) };
+        }
+
+        // Only fall back for `EINVAL` caused by a large offset.
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EINVAL) || offset <= i64::MAX as u64 {
+            return Err(err);
+        }
+
+        debug!("lseek64 failed for directory offset {offset:#x}, falling back to linear scan");
+
+        Self::new_walk_to(dir, offset, buf)
+    }
+
+    /// Fallback for offsets that `lseek64` cannot handle: rewinds and walks
+    /// entries until the target cookie.
+    fn new_walk_to<D: AsRawFd>(dir: &D, target_offset: u64, mut buf: P) -> io::Result<Self> {
+        // SAFETY: Safe because this doesn't modify any memory and we check the return value.
+        let res = unsafe { libc::lseek64(dir.as_raw_fd(), 0, libc::SEEK_SET) };
         if res < 0 {
             return Err(io::Error::last_os_error());
         }
 
-        // Safe because we used lseek() to get to the correct position
-        unsafe { Self::new_no_seek(dir, buf) }
+        loop {
+            let mut rd = unsafe { Self::new_no_seek(dir, buf)? };
+            if rd.remaining() == 0 {
+                return Ok(rd); // not found
+            }
+
+            // `d_off` is an opaque cookie interpretable only by the filesystem
+            // that generated it. It may be supplied as an offset to `lseek()`
+            // to position the directory stream after the current entry (not at it).
+            // So to resume from a given cookie, we must skip past the entry with
+            // `d_off == target_offset`, and return everything that follows.
+            if rd.move_past(target_offset) {
+                if rd.remaining() > 0 {
+                    return Ok(rd); // found
+                }
+                // it's last in this batch, fd is already at the next one
+                return unsafe { Self::new_no_seek(dir, rd.buf) };
+            }
+
+            buf = rd.buf; // not in this batch
+        }
+    }
+
+    /// Move past `target_offset`. Everything remaining is what the guest has not yet received.
+    fn move_past(&mut self, target_offset: u64) -> bool {
+        while let Some(entry) = DirectoryIterator::next(self) {
+            if entry.offset == target_offset {
+                return true;
+            }
+        }
+        false
     }
 
     /// Continue reading from the current position in the directory without seeking.
