@@ -144,9 +144,16 @@ Enable writeback cache.
 Enable support for extended attributes.
 
 ```shell
---posix-acl
+--posix-acl[=<always|auto|never>]
 ```
 Enable support for posix ACLs (implies --xattr).
+The mode controls POSIX ACL capability negotiation:
+- `always`: require POSIX ACL support, error if the guest does not support it.
+- `auto`: enable if the guest supports it.
+- `never`: disable POSIX ACL support.
+
+The default is `never`. When `--posix-acl` is passed without a value, it
+defaults to `always`.
 
 ```shell
 --security-label
@@ -371,8 +378,8 @@ host-to-guest mapping.  The only exception is the prefix-less form, which sets u
 
 When giving multiple mappings, their source ranges must not overlap.
 
-Neither of `--translate-uid` and `--translate-gid` can be used together with `--posix-acl`; translating UIDs or GIDs in
-virtiofsd would break posix ACLs.
+Neither of `--translate-uid` and `--translate-gid` can be used together with `--posix-acl=always|auto`; translating UIDs
+or GIDs in virtiofsd would break posix ACLs.
 
 Example use case: virtiofsd runs unprivileged with UID:GID 1001:100.  It cannot change its own UID/GID, so attempting to
 let the guest create files with any other UID/GID combination will fail.  By using `--translate-uid` and

@@ -4,6 +4,7 @@
   "binary": "/usr/libexec/virtiofsd",
   "features": [
       "migrate-precopy",
+      "posix-acl-negotiation-mode",
       "separate-options"
   ]
 }

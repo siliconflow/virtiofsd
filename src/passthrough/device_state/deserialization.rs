@@ -18,7 +18,8 @@ use crate::passthrough::mount_fd::MountFd;
 use crate::passthrough::stat::statx;
 use crate::passthrough::util::{openat, printable_fd};
 use crate::passthrough::{
-    FileOrHandle, HandleData, HandleDataFile, InodeFileHandlesMode, MigrationOnError, PassthroughFs,
+    FileOrHandle, HandleData, HandleDataFile, InodeFileHandlesMode, MigrationOnError,
+    NegotiationMode, PassthroughFs,
 };
 use crate::util::{other_io_error, ErrorContext, ResultErrorContext};
 use std::collections::{BTreeMap, HashMap};
@@ -188,7 +189,7 @@ impl serialized::NegotiatedOpts {
         fs.announce_submounts
             .store(self.announce_submounts, Ordering::Relaxed);
 
-        if !fs.cfg.posix_acl && self.posix_acl {
+        if fs.cfg.posix_acl == NegotiationMode::Never && self.posix_acl {
             return Err(other_io_error(
                 "Migration source wants posix ACLs enabled, but it is disabled on the destination",
             ));
