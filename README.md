@@ -156,9 +156,16 @@ The default is `never`. When `--posix-acl` is passed without a value, it
 defaults to `always`.
 
 ```shell
---security-label
+--security-label[=<always|auto|never>]
 ```
-Enable support for security label (SELinux). Implies --xattr.
+Enable support for security label (SELinux), implies --xattr.
+The mode controls security label capability negotiation:
+- `always`: require security label support, error if the guest does not support it.
+- `auto`: enable if the guest supports it.
+- `never`: disable security label support.
+
+The default is `never`. When `--security-label` is passed without a value, it
+defaults to `always`.
 
 ```shell
 --preserve-noatime
@@ -646,7 +653,7 @@ Note: announce-submounts is enabled by default to prevent data loss/corruption.
 
 ## SELinux Support
 One can enable support for SELinux by running virtiofsd with option
-"--security-label". But this will try to save guest's security context
+"--security-label=always|auto". But this will try to save guest's security context
 in xattr security.selinux on host and it might fail if host's SELinux
 policy does not permit virtiofsd to do this operation.
 

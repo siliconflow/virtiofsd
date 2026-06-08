@@ -374,13 +374,13 @@ pub struct Config {
     /// The default is `Never`.
     pub posix_acl: NegotiationMode,
 
-    /// If `security_label` is true, then server will indicate to client
+    /// If `security_label` is enabled during negotiation, then server will indicate to client
     /// to send any security context associated with file during file
     /// creation and set that security context on newly created file.
     /// This security context is expected to be security.selinux.
     ///
-    /// The default is `false`.
-    pub security_label: bool,
+    /// The default is `Never`.
+    pub security_label: NegotiationMode,
 
     /// If `clean_noatime` is true automatically clean up O_NOATIME flag to prevent potential
     /// permission errors.
@@ -457,7 +457,7 @@ impl Default for Config {
             allow_direct_io: false,
             killpriv_v2: false,
             posix_acl: NegotiationMode::Never,
-            security_label: false,
+            security_label: NegotiationMode::Never,
             clean_noatime: true,
             allow_mmap: false,
             migration_on_error: MigrationOnError::Abort,
@@ -1598,12 +1598,16 @@ impl FileSystem for PassthroughFs {
             }
         }
 
-        if self.cfg.security_label {
+        if self.cfg.security_label != NegotiationMode::Never {
             if capable.contains(FsOptions::SECURITY_CTX) {
                 opts |= FsOptions::SECURITY_CTX;
-            } else {
+            } else if self.cfg.security_label == NegotiationMode::Always {
                 error!("Cannot enable security label. kernel does not support FUSE_SECURITY_CTX capability");
                 return Err(io::Error::from_raw_os_error(libc::EPROTO));
+            } else {
+                warn!(
+                    "security label requested but kernel does not support it, continuing without"
+                );
             }
         }
 

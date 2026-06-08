@@ -5,6 +5,7 @@
   "features": [
       "migrate-precopy",
       "posix-acl-negotiation-mode",
+      "security-label-negotiation-mode",
       "separate-options"
   ]
 }

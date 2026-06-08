@@ -272,10 +272,11 @@ struct Opt {
     #[arg(short = 'f')]
     compat_foreground: bool,
 
-    /// Enable security label support (implies --xattr). Expects SELinux xattr on file creation
+    /// Enable security label support (implies --xattr).
+    /// If enabled, expects SELinux xattr on file creation
     /// from client and stores it in the newly created file.
-    #[arg(long = "security-label")]
-    security_label: bool,
+    #[arg(long = "security-label", require_equals = true, default_value = "never", default_missing_value = "always", num_args = 0..=1, value_name = "never|auto|always")]
+    security_label: NegotiationMode,
 
     /// Map a range of UIDs from the host into the namespace, given as
     /// :namespace_uid:host_uid:count:
@@ -481,8 +482,8 @@ fn parse_compat(opt: Opt) -> Opt {
             "no_killpriv_v2" => opt.killpriv_v2 = false,
             "posix_acl" => opt.posix_acl = NegotiationMode::Always,
             "no_posix_acl" => opt.posix_acl = NegotiationMode::Never,
-            "security_label" => opt.security_label = true,
-            "no_security_label" => opt.security_label = false,
+            "security_label" => opt.security_label = NegotiationMode::Always,
+            "no_security_label" => opt.security_label = NegotiationMode::Never,
             "no_posix_lock" | "no_flock" => (),
             _ => argument_error(option),
         }
@@ -511,6 +512,7 @@ fn print_capabilities() {
     println!("  \"features\": [");
     println!("    \"migrate-precopy\",");
     println!("    \"posix-acl-negotiation-mode\",");
+    println!("    \"security-label-negotiation-mode\",");
     println!("    \"separate-options\"");
     println!("  ]");
     println!("}}");
@@ -710,7 +712,7 @@ fn main() {
     let xattrmap = opt.xattrmap.clone();
     let xattr = xattrmap.is_some()
         || opt.posix_acl != NegotiationMode::Never
-        || opt.security_label
+        || opt.security_label != NegotiationMode::Never
         || opt.xattr;
     let thread_pool_size = opt.thread_pool_size;
     let readdirplus = match opt.cache {
