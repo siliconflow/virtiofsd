@@ -193,6 +193,71 @@ fn strip_padding(b: &[u8]) -> &CStr {
 #[cfg(test)]
 mod test {
     use super::*;
+    use std::ffi::CString;
+    use std::fs;
+    use vmm_sys_util::tempdir::TempDir;
+
+    fn make_test_dir(num_files: usize) -> (TempDir, fs::File) {
+        let td = TempDir::new_with_prefix("/tmp/virtiofsd_test_").unwrap();
+        for i in 0..num_files {
+            fs::write(td.as_path().join(format!("file_{i:03}")), b"").unwrap();
+        }
+        let file = fs::File::open(td.as_path()).unwrap();
+        (td, file)
+    }
+
+    /// Build a fake `ReadDir` from raw dirent fields.
+    /// `entry` is `(d_ino, d_off, name)`.
+    fn build_dirent_buf(entries: &[(u64, u64, &[u8])]) -> ReadDir<Vec<u8>> {
+        let header = size_of::<LinuxDirent64>();
+        let mut buf = vec![0u8; 4096];
+        let mut pos = 0;
+        for &(ino, d_off, name) in entries {
+            let reclen = (header + name.len() + 1).next_multiple_of(8);
+            let dirent = LinuxDirent64 {
+                d_ino: ino,
+                d_off: d_off as i64,
+                d_reclen: reclen as libc::c_ushort,
+                d_ty: libc::DT_REG,
+            };
+            assert!(
+                pos + reclen <= buf.len(),
+                "dirent buffer overflow: need {} bytes but buf is {}",
+                pos + reclen,
+                buf.len()
+            );
+            buf[pos..pos + header].copy_from_slice(dirent.as_slice());
+            buf[pos + header..pos + header + name.len()].copy_from_slice(name);
+            pos += reclen;
+        }
+        ReadDir {
+            buf,
+            current: 0,
+            end: pos,
+        }
+    }
+
+    fn next_entry(rd: &mut ReadDir<Vec<u8>>) -> Option<(u64, u64, CString)> {
+        let e = rd.next()?;
+        Some((e.ino, e.offset, e.name.to_owned()))
+    }
+
+    /// Read all entries from `directory`. Returns `(d_ino, d_off, name)` tuples.
+    fn collect_entries(directory: &fs::File) -> Vec<(u64, u64, CString)> {
+        let mut entries = Vec::new();
+        let mut offset: u64 = 0;
+        loop {
+            let mut rd = ReadDir::new(directory, offset, vec![0u8; 4096]).unwrap();
+            if rd.remaining() == 0 {
+                break;
+            }
+            while let Some(e) = next_entry(&mut rd) {
+                offset = e.1;
+                entries.push(e);
+            }
+        }
+        entries
+    }
 
     #[test]
     fn padded_cstrings() {
@@ -213,5 +278,76 @@ mod test {
     #[should_panic(expected = "`b` doesn't contain any nul bytes")]
     fn no_nul_byte() {
         strip_padding(b"no nul bytes in string");
+    }
+
+    #[test]
+    fn move_past_finds_target_in_middle() {
+        let mut rd = build_dirent_buf(&[(1, 100, b"a"), (2, 200, b"b"), (3, 300, b"c")]);
+        assert!(ReadDir::move_past(&mut rd, 200));
+        let e = next_entry(&mut rd).unwrap();
+        assert_eq!((e.0, e.1), (3, 300));
+    }
+
+    #[test]
+    fn move_past_finds_target_at_end() {
+        let mut rd = build_dirent_buf(&[(1, 100, b"a"), (2, 200, b"b")]);
+        assert!(ReadDir::move_past(&mut rd, 200));
+        assert_eq!(rd.remaining(), 0);
+    }
+
+    #[test]
+    fn move_past_not_found() {
+        let mut rd = build_dirent_buf(&[(1, 100, b"a"), (2, 200, b"b")]);
+        assert!(!ReadDir::move_past(&mut rd, 999));
+        assert_eq!(rd.remaining(), 0);
+    }
+
+    #[test]
+    fn move_past_large_cookie() {
+        let large = u64::MAX - 42;
+        let mut rd = build_dirent_buf(&[(1, 100, b"a"), (2, large, b"b"), (3, 300, b"c")]);
+        assert!(ReadDir::move_past(&mut rd, large));
+        let e = next_entry(&mut rd).unwrap();
+        assert_eq!((e.0, e.1), (3, 300));
+    }
+
+    #[test]
+    fn new_walk_to_matches_lseek_path() {
+        let (_td, file) = make_test_dir(10);
+        let all = collect_entries(&file);
+
+        for i in 0..all.len() - 1 {
+            let cookie = all[i].1;
+            let mut rd_seek = ReadDir::new(&file, cookie, vec![0u8; 4096]).unwrap();
+            let mut rd_walk = ReadDir::new_walk_to(&file, cookie, vec![0u8; 4096]).unwrap();
+
+            loop {
+                match (next_entry(&mut rd_seek), next_entry(&mut rd_walk)) {
+                    (None, None) => break,
+                    (Some(a), Some(b)) => assert_eq!(a, b, "mismatch at cookie {}", cookie),
+                    _ => panic!("entry count mismatch at cookie {}", cookie),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn new_walk_to_small_buffer() {
+        let (_td, file) = make_test_dir(20);
+        let all = collect_entries(&file);
+
+        for i in 0..all.len() - 1 {
+            let cookie = all[i].1;
+            let mut rd = ReadDir::new_walk_to(&file, cookie, vec![0u8; 128]).unwrap();
+            let e = next_entry(&mut rd).expect("expected entry after cookie");
+            assert_eq!(e.0, all[i + 1].0, "ino mismatch at cookie {}", cookie);
+        }
+    }
+
+    #[test]
+    fn new_falls_back_to_walk_for_large_offset() {
+        let (_td, file) = make_test_dir(1);
+        let rd = ReadDir::new(&file, u64::MAX, vec![0u8; 4096]).unwrap();
+        assert_eq!(rd.remaining(), 0);
     }
 }
