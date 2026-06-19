@@ -7,7 +7,7 @@ use std::fs::File;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
-use std::{convert, error, fmt, io};
+use std::{convert, error, fmt, io, process};
 
 use futures::executor::{ThreadPool, ThreadPoolBuilder};
 use log::*;
@@ -101,6 +101,9 @@ impl fmt::Display for Error {
                 f,
                 "The tag may not be empty or longer than {MAX_TAG_LEN} bytes (encoded as UTF-8)."
             ),
+            Self::QueueReader(e) => write!(f, "Failed to create a queue reader: {e}"),
+            Self::QueueWriter(e) => write!(f, "Failed to create a queue writer: {e}"),
+            Self::ProcessQueue(e) => write!(f, "Failed to handle an incoming request: {e}"),
             _ => write!(f, "{self:?}"),
         }
     }
@@ -193,6 +196,20 @@ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFs
         }
     }
 
+    fn process_message(
+        server: &Server<F>,
+        mem: &GuestMemoryLoadGuard<LoggedMemory>,
+        chain: DescriptorChain<GuestMemoryLoadGuard<LoggedMemory>>,
+        vu_req: Option<&mut Backend>,
+    ) -> Result<usize> {
+        let reader = Reader::new(mem, chain.clone()).map_err(Error::QueueReader)?;
+        let writer = Writer::new(mem, chain).map_err(Error::QueueWriter)?;
+
+        server
+            .handle_message(reader, writer, vu_req)
+            .map_err(Error::ProcessQueue)
+    }
+
     fn process_queue_pool(&self, vring: VringMutex<LoggedMemoryAtomic>) -> Result<bool> {
         let mut used_any = false;
         let atomic_mem = match &self.mem {
@@ -221,17 +238,11 @@ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFs
                 let mem = atomic_mem.memory();
                 let head_index = worker_desc.head_index();
 
-                let reader = Reader::new(&mem, worker_desc.clone())
-                    .map_err(Error::QueueReader)
-                    .unwrap();
-                let writer = Writer::new(&mem, worker_desc.clone())
-                    .map_err(Error::QueueWriter)
-                    .unwrap();
-
-                let len = server
-                    .handle_message(reader, writer, vu_req.as_mut())
-                    .map_err(Error::ProcessQueue)
-                    .unwrap();
+                let len = Self::process_message(&server, &mem, worker_desc, vu_req.as_mut())
+                    .unwrap_or_else(|e| {
+                        error!("{e}");
+                        process::exit(1);
+                    });
 
                 Self::return_descriptor(&mut worker_vring.get_mut(), head_index, event_idx, len);
             });
@@ -262,18 +273,11 @@ impl<F: FileSystem + SerializableFileSystem + Send + Sync + 'static> VhostUserFs
 
             let head_index = chain.head_index();
 
-            let reader = Reader::new(&mem, chain.clone())
-                .map_err(Error::QueueReader)
-                .unwrap();
-            let writer = Writer::new(&mem, chain.clone())
-                .map_err(Error::QueueWriter)
-                .unwrap();
-
-            let len = self
-                .server
-                .handle_message(reader, writer, vu_req.as_mut())
-                .map_err(Error::ProcessQueue)
-                .unwrap();
+            let len = Self::process_message(&self.server, &mem, chain, vu_req.as_mut())
+                .unwrap_or_else(|e| {
+                    error!("{e}");
+                    process::exit(1);
+                });
 
             Self::return_descriptor(vring_state, head_index, self.event_idx, len);
         }
