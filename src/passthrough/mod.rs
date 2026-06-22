@@ -144,6 +144,40 @@ impl FromStr for CachePolicy {
     }
 }
 
+/// Whether and how to enable an optional feature during capability negotiation.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum NegotiationMode {
+    /// Do not enable the feature
+    Never,
+    /// Enable if the guest supports it, warn otherwise
+    Auto,
+    /// Require the feature, error if unsupported
+    Always,
+}
+
+impl std::fmt::Display for NegotiationMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NegotiationMode::Never => write!(f, "never"),
+            NegotiationMode::Auto => write!(f, "auto"),
+            NegotiationMode::Always => write!(f, "always"),
+        }
+    }
+}
+
+impl FromStr for NegotiationMode {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "never" => Ok(NegotiationMode::Never),
+            "auto" => Ok(NegotiationMode::Auto),
+            "always" => Ok(NegotiationMode::Always),
+            _ => Err("invalid mode, expected: never, auto, always"),
+        }
+    }
+}
+
 /// When to use file handles to reference inodes instead of `O_PATH` file descriptors.
 #[derive(Default, Debug, Copy, Clone, PartialEq, Eq)]
 pub enum InodeFileHandlesMode {
@@ -337,16 +371,16 @@ pub struct Config {
 
     /// Enable support for posix ACLs
     ///
-    /// The default is `false`.
-    pub posix_acl: bool,
+    /// The default is `Never`.
+    pub posix_acl: NegotiationMode,
 
-    /// If `security_label` is true, then server will indicate to client
+    /// If `security_label` is enabled during negotiation, then server will indicate to client
     /// to send any security context associated with file during file
     /// creation and set that security context on newly created file.
     /// This security context is expected to be security.selinux.
     ///
-    /// The default is `false`.
-    pub security_label: bool,
+    /// The default is `Never`.
+    pub security_label: NegotiationMode,
 
     /// If `clean_noatime` is true automatically clean up O_NOATIME flag to prevent potential
     /// permission errors.
@@ -422,8 +456,8 @@ impl Default for Config {
             readdirplus: true,
             allow_direct_io: false,
             killpriv_v2: false,
-            posix_acl: false,
-            security_label: false,
+            posix_acl: NegotiationMode::Never,
+            security_label: NegotiationMode::Never,
             clean_noatime: true,
             allow_mmap: false,
             migration_on_error: MigrationOnError::Abort,
@@ -1549,25 +1583,31 @@ impl FileSystem for PassthroughFs {
                 warn!("Cannot enable KILLPRIV_V2, client does not support it");
             }
         }
-        if self.cfg.posix_acl {
+        if self.cfg.posix_acl != NegotiationMode::Never {
             let acl_required_flags =
                 FsOptions::POSIX_ACL | FsOptions::DONT_MASK | FsOptions::SETXATTR_EXT;
             if capable.contains(acl_required_flags) {
                 opts |= acl_required_flags;
                 self.posix_acl.store(true, Ordering::Relaxed);
                 debug!("init: enabling posix acl");
-            } else {
+            } else if self.cfg.posix_acl == NegotiationMode::Always {
                 error!("Cannot enable posix ACLs, client does not support it");
                 return Err(io::Error::from_raw_os_error(libc::EPROTO));
+            } else {
+                warn!("posix ACLs requested but client does not support it, continuing without");
             }
         }
 
-        if self.cfg.security_label {
+        if self.cfg.security_label != NegotiationMode::Never {
             if capable.contains(FsOptions::SECURITY_CTX) {
                 opts |= FsOptions::SECURITY_CTX;
-            } else {
+            } else if self.cfg.security_label == NegotiationMode::Always {
                 error!("Cannot enable security label. kernel does not support FUSE_SECURITY_CTX capability");
                 return Err(io::Error::from_raw_os_error(libc::EPROTO));
+            } else {
+                warn!(
+                    "security label requested but kernel does not support it, continuing without"
+                );
             }
         }
 

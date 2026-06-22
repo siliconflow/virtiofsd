@@ -24,7 +24,8 @@ use vhost_user_backend::VhostUserDaemon;
 use virtiofsd::filesystem::{FileSystem, SerializableFileSystem};
 use virtiofsd::passthrough::read_only::PassthroughFsRo;
 use virtiofsd::passthrough::{
-    self, CachePolicy, InodeFileHandlesMode, MigrationMode, MigrationOnError, PassthroughFs,
+    self, CachePolicy, InodeFileHandlesMode, MigrationMode, MigrationOnError, NegotiationMode,
+    PassthroughFs,
 };
 use virtiofsd::sandbox::{Sandbox, SandboxMode};
 use virtiofsd::seccomp::{enable_seccomp, SeccompAction};
@@ -161,8 +162,8 @@ struct Opt {
     xattr: bool,
 
     /// Enable support for posix ACLs (implies --xattr)
-    #[arg(long)]
-    posix_acl: bool,
+    #[arg(long, require_equals = true, default_value = "never", default_missing_value = "always", num_args = 0..=1, value_name = "never|auto|always")]
+    posix_acl: NegotiationMode,
 
     /// Add custom rules for translating extended attributes between host and guest
     /// (e.g. :map::user.virtiofs.:)
@@ -271,10 +272,11 @@ struct Opt {
     #[arg(short = 'f')]
     compat_foreground: bool,
 
-    /// Enable security label support (implies --xattr). Expects SELinux xattr on file creation
+    /// Enable security label support (implies --xattr).
+    /// If enabled, expects SELinux xattr on file creation
     /// from client and stores it in the newly created file.
-    #[arg(long = "security-label")]
-    security_label: bool,
+    #[arg(long = "security-label", require_equals = true, default_value = "never", default_missing_value = "always", num_args = 0..=1, value_name = "never|auto|always")]
+    security_label: NegotiationMode,
 
     /// Map a range of UIDs from the host into the namespace, given as
     /// :namespace_uid:host_uid:count:
@@ -326,13 +328,13 @@ struct Opt {
     ///
     /// Provide this argument multiple times to map multiple UID ranges.
     ///
-    /// Cannot be used together with --posix-acl; translating UIDs (or GIDs) in virtiofsd would
-    /// break posix ACLs.
-    #[arg(long, conflicts_with = "posix_acl")]
+    /// Cannot be used together with --posix-acl=always|auto; translating UIDs (or GIDs) in
+    /// virtiofsd would break posix ACLs.
+    #[arg(long)]
     translate_uid: Vec<soft_idmap::cmdline::IdMap>,
 
     /// Same as '--translate-uid', but for GIDs.
-    #[arg(long, conflicts_with = "posix_acl")]
+    #[arg(long)]
     translate_gid: Vec<soft_idmap::cmdline::IdMap>,
 
     /// Preserve O_NOATIME behavior, otherwise automatically clean up O_NOATIME flag to prevent
@@ -478,10 +480,10 @@ fn parse_compat(opt: Opt) -> Opt {
             "announce_submounts" => opt.announce_submounts = true,
             "killpriv_v2" => opt.killpriv_v2 = true,
             "no_killpriv_v2" => opt.killpriv_v2 = false,
-            "posix_acl" => opt.posix_acl = true,
-            "no_posix_acl" => opt.posix_acl = false,
-            "security_label" => opt.security_label = true,
-            "no_security_label" => opt.security_label = false,
+            "posix_acl" => opt.posix_acl = NegotiationMode::Always,
+            "no_posix_acl" => opt.posix_acl = NegotiationMode::Never,
+            "security_label" => opt.security_label = NegotiationMode::Always,
+            "no_security_label" => opt.security_label = NegotiationMode::Never,
             "no_posix_lock" | "no_flock" => (),
             _ => argument_error(option),
         }
@@ -509,6 +511,8 @@ fn print_capabilities() {
     println!("  \"type\": \"fs\",");
     println!("  \"features\": [");
     println!("    \"migrate-precopy\",");
+    println!("    \"posix-acl-negotiation-mode\",");
+    println!("    \"security-label-negotiation-mode\",");
     println!("    \"separate-options\"");
     println!("  ]");
     println!("}}");
@@ -694,8 +698,22 @@ fn main() {
         }
     }
 
+    if opt.posix_acl != NegotiationMode::Never
+        && (!opt.translate_uid.is_empty() || !opt.translate_gid.is_empty())
+    {
+        error!(
+            "Cannot use --translate-uid or --translate-gid with --posix-acl={}, \
+             translating UIDs/GIDs would break posix ACLs",
+            opt.posix_acl
+        );
+        process::exit(1);
+    }
+
     let xattrmap = opt.xattrmap.clone();
-    let xattr = xattrmap.is_some() || opt.posix_acl || opt.security_label || opt.xattr;
+    let xattr = xattrmap.is_some()
+        || opt.posix_acl != NegotiationMode::Never
+        || opt.security_label != NegotiationMode::Never
+        || opt.xattr;
     let thread_pool_size = opt.thread_pool_size;
     let readdirplus = match opt.cache {
         CachePolicy::Never => false,
