@@ -18,7 +18,7 @@ use crate::passthrough::mount_fd::MountFd;
 use crate::passthrough::stat::statx;
 use crate::passthrough::util::{openat, printable_fd};
 use crate::passthrough::{
-    FileOrHandle, HandleData, HandleDataFile, InodeFileHandlesMode, MigrationOnError,
+    FileOrHandle, FileType, HandleData, HandleDataFile, InodeFileHandlesMode, MigrationOnError,
     NegotiationMode, PassthroughFs,
 };
 use crate::util::{other_io_error, ErrorContext, ResultErrorContext};
@@ -525,6 +525,7 @@ impl serialized::Handle {
         let handle_data = HandleData {
             inode: self.inode,
             file,
+            file_type: FileType::from_mode(inode.mode),
             migration_info,
         };
         fs.handles

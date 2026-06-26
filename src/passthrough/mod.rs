@@ -72,9 +72,23 @@ enum HandleDataFile {
     Invalid(Arc<io::Error>),
 }
 
+#[derive(Copy, Clone, Debug)]
+struct FileType(u32);
+
+impl FileType {
+    fn from_mode(mode: u32) -> Self {
+        FileType(mode & libc::S_IFMT)
+    }
+
+    fn is_regular_file(&self) -> bool {
+        self.0 == libc::S_IFREG
+    }
+}
+
 struct HandleData {
     inode: Inode,
     file: HandleDataFile,
+    file_type: FileType,
 
     // On migration, must be set when we serialize our internal state to send it to the
     // destination.  As long as `HandleMigrationInfo::new()` is cheap, we may as well
@@ -986,6 +1000,7 @@ impl PassthroughFs {
         }
 
         let inode_data = self.inodes.get(inode).ok_or_else(ebadf)?;
+        let file_type = FileType::from_mode(inode_data.mode);
         let file = {
             let _killpriv_guard = if self.cfg.killpriv_v2 && kill_priv {
                 drop_effective_cap("FSETID")?
@@ -996,13 +1011,14 @@ impl PassthroughFs {
         };
 
         if flags & (libc::O_TRUNC as u32) != 0 {
-            self.clear_file_capabilities(file.as_raw_fd(), false)?;
+            self.clear_file_capabilities(file.as_raw_fd(), file_type, false)?;
         }
 
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
         let data = HandleData {
             inode,
             file: self.guest_fds.allocate(file)?.into(),
+            file_type,
             migration_info: HandleMigrationInfo::new(flags as i32),
         };
 
@@ -1131,13 +1147,20 @@ impl PassthroughFs {
     }
 
     /// Clears file capabilities
+    /// Only clears capabilities on regular files, matching kernel semantics.
     ///
     /// * `fd` - A file descriptor
+    /// * `file_type` - The type of the file
     /// * `o_path` - Must be `true` if the file referred to by `fd` was opened with the `O_PATH` flag
     ///
     /// If it is not clear whether `fd` was opened with `O_PATH` it is safe to set `o_path`
     /// to `true`.
-    fn clear_file_capabilities(&self, fd: RawFd, o_path: bool) -> io::Result<()> {
+    fn clear_file_capabilities(
+        &self,
+        fd: RawFd,
+        file_type: FileType,
+        o_path: bool,
+    ) -> io::Result<()> {
         match self.cfg.xattr_security_capability.as_ref() {
             // Unmapped, let the kernel take care of this.
             None => Ok(()),
@@ -1145,6 +1168,13 @@ impl PassthroughFs {
             // would; which is to drop the "security.capability" xattr
             // on write
             Some(xattrname) => {
+                // The kernel's `chown_common()` (i.e., `chown()`/`chgrp()`) and nfsd
+                // clear caps on all non-directory inodes, but file caps are only
+                // consumed by `execve()`, which is restricted to regular files.
+                if !file_type.is_regular_file() {
+                    return Ok(());
+                }
+
                 let res = if o_path {
                     let proc_file_name = CString::new(format!("{fd}"))
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -1827,6 +1857,7 @@ impl FileSystem for PassthroughFs {
                 let data = HandleData {
                     inode: entry.inode,
                     file: self.guest_fds.allocate(file)?.into(),
+                    file_type: FileType::from_mode(mode),
                     migration_info: HandleMigrationInfo::new(flags as i32),
                 };
 
@@ -1899,7 +1930,7 @@ impl FileSystem for PassthroughFs {
                 None
             };
 
-            self.clear_file_capabilities(f.as_raw_fd(), false)?;
+            self.clear_file_capabilities(f.as_raw_fd(), data.file_type, false)?;
 
             // We don't set the `RWF_APPEND` (i.e., equivalent to `O_APPEND`) flag, if it's a
             // delayed write (i.e., using writeback mode or a mem mapped file) even if the file
@@ -1931,6 +1962,7 @@ impl FileSystem for PassthroughFs {
         valid: SetattrValid,
     ) -> io::Result<(fuse::Attr, Duration)> {
         let inode_data = self.inodes.get(inode).ok_or_else(ebadf)?;
+        let file_type = FileType::from_mode(inode_data.mode);
 
         // In this case, we need to open a new O_RDWR FD
         let rdwr_inode_file = handle.is_none() && valid.intersects(SetattrValid::SIZE);
@@ -1988,7 +2020,7 @@ impl FileSystem for PassthroughFs {
                 u32::MAX
             };
 
-            self.clear_file_capabilities(inode_file.as_raw_fd(), true)?;
+            self.clear_file_capabilities(inode_file.as_raw_fd(), file_type, true)?;
 
             // Safe because this is a constant value and a valid C string.
             let empty = unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) };
@@ -2027,7 +2059,7 @@ impl FileSystem for PassthroughFs {
 
             // Safe because this doesn't modify any memory and we check the return value.
             let res = self
-                .clear_file_capabilities(fd, false)
+                .clear_file_capabilities(fd, file_type, false)
                 .map(|_| unsafe { libc::ftruncate(fd, attr.size as i64) })?;
             if res < 0 {
                 return Err(io::Error::last_os_error());
@@ -2408,12 +2440,13 @@ impl FileSystem for PassthroughFs {
             name.as_ref(),
         );
 
+        let file_type = FileType::from_mode(data.mode);
         let res = if is_safe_inode(data.mode) {
             // The f{set,get,remove,list}xattr functions don't work on an fd opened with `O_PATH` so we
             // need to get a new fd.
             let file = self.open_inode(&data, libc::O_RDONLY | libc::O_NONBLOCK)?;
 
-            self.clear_file_capabilities(file.as_raw_fd(), false)?;
+            self.clear_file_capabilities(file.as_raw_fd(), file_type, false)?;
 
             if must_clear_sgid {
                 self.clear_sgid(&file, false)?;
@@ -2432,7 +2465,9 @@ impl FileSystem for PassthroughFs {
         } else {
             let file = data.get_file()?;
 
-            self.clear_file_capabilities(file.as_raw_fd(), true)?;
+            // No-op for non-regular files (is_safe_inode is true only for regular files and
+            // directories). Kept for consistency.
+            self.clear_file_capabilities(file.as_raw_fd(), file_type, true)?;
 
             if must_clear_sgid {
                 self.clear_sgid(&file, true)?;
