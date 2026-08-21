@@ -672,15 +672,21 @@ impl PassthroughFs {
             .ok_or_else(ebadf)
     }
 
-    fn open_inode(&self, data: &InodeData, mut flags: i32) -> io::Result<File> {
+    fn update_writeback_open_flags(mut flags: i32, writeback: bool) -> i32 {
         // When writeback caching is enabled, the kernel may send read requests even if the
         // userspace program opened the file write-only. So we need to ensure that we have opened
         // the file for reading as well as writing.
-        let writeback = self.writeback.load(Ordering::Relaxed);
         if writeback && flags & libc::O_ACCMODE == libc::O_WRONLY {
             flags &= !libc::O_ACCMODE;
             flags |= libc::O_RDWR;
         }
+
+        flags
+    }
+
+    fn open_inode(&self, data: &InodeData, flags: i32) -> io::Result<File> {
+        let writeback = self.writeback.load(Ordering::Relaxed);
+        let mut flags = Self::update_writeback_open_flags(flags, writeback);
 
         // When writeback caching is enabled the kernel is responsible for handling `O_APPEND`.
         // However, this breaks atomicity as the file may have changed on disk, invalidating the
@@ -1818,7 +1824,9 @@ impl FileSystem for PassthroughFs {
         // We need to clean the `O_APPEND` flag in case the file is mem mapped or if the flag
         // is later modified in the guest using `fcntl(F_SETFL)`. We do a per-write `O_APPEND`
         // check setting `RWF_APPEND` for non-mmapped writes, if necessary.
-        let create_flags = flags & !(libc::O_APPEND as u32);
+        let writeback = self.writeback.load(Ordering::Relaxed);
+        let create_flags = (flags & !(libc::O_APPEND as u32)) as i32;
+        let create_flags = Self::update_writeback_open_flags(create_flags, writeback) as u32;
         let fd = self.do_create(
             &ctx,
             &parent_file,
@@ -2777,6 +2785,46 @@ impl From<GuestFile> for HandleDataFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vmm_sys_util::tempdir::TempDir;
+
+    #[test]
+    fn create_write_only_with_writeback_opens_read_write() {
+        let shared_dir = TempDir::new_with_prefix("/tmp/virtiofsd_test_").unwrap();
+        let fs = PassthroughFs::new(Config {
+            root_dir: shared_dir.as_path().to_string_lossy().into_owned(),
+            writeback: true,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let negotiated = fs.init(FsOptions::WRITEBACK_CACHE).unwrap();
+        assert!(negotiated.contains(FsOptions::WRITEBACK_CACHE));
+
+        let context = Context {
+            uid: unsafe { libc::geteuid() }.into(),
+            gid: unsafe { libc::getegid() }.into(),
+            pid: unsafe { libc::getpid() },
+        };
+        let name = CStr::from_bytes_with_nul(b"writeback\0").unwrap();
+        let (entry, handle, _) = fs
+            .create(
+                context,
+                fuse::ROOT_ID,
+                name,
+                0o600,
+                false,
+                libc::O_WRONLY as u32,
+                0,
+                Extensions::default(),
+            )
+            .unwrap();
+
+        let data = fs.find_handle(handle.unwrap(), entry.inode).unwrap();
+        let file = data.file.get().unwrap().read().unwrap();
+        let host_flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+        assert!(host_flags >= 0);
+        assert_eq!(host_flags & libc::O_ACCMODE, libc::O_RDWR);
+    }
 
     #[test]
     fn setxattr_non_utf8_name_does_not_clear_sgid() {
