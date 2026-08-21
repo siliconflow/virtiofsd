@@ -1,0 +1,140 @@
+name: Release
+
+on:
+  release:
+    types:
+      - published
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.release.id }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+
+    env:
+      RELEASE_TAG: ${{ github.event.release.tag_name }}
+      TARGET: ${{ matrix.target }}
+
+    steps:
+      - name: Check out released source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Validate tag and package version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="$(cargo metadata --locked --no-deps --format-version 1 | jq --raw-output '.packages[] | select(.name == "virtiofsd") | .version')"
+          expected_tag="v${version}"
+
+          if [[ "${RELEASE_TAG}" != "${expected_tag}" ]]; then
+            echo "Release tag ${RELEASE_TAG} does not match Cargo package version ${version}." >&2
+            exit 1
+          fi
+
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Build static Linux binary
+        run: |
+          docker run --rm \
+            --volume "${GITHUB_WORKSPACE}:/workspace" \
+            --workdir /workspace \
+            --env "TARGET=${TARGET}" \
+            rust:alpine \
+            sh -euc '
+              apk add --no-cache libcap-ng-static libseccomp-static musl-dev
+              RUSTFLAGS="-C target-feature=+crt-static -C link-self-contained=yes" \
+              LIBSECCOMP_LINK_TYPE=static \
+              LIBSECCOMP_LIB_PATH=/usr/lib \
+              LIBCAPNG_LINK_TYPE=static \
+              LIBCAPNG_LIB_PATH=/usr/lib \
+              cargo build --locked --release --target "${TARGET}"
+            '
+
+      - name: Verify and package binary
+        id: package
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          binary="target/${TARGET}/release/virtiofsd"
+          expected_version="virtiofsd ${VERSION}"
+          actual_version="$(${binary} -V)"
+
+          if [[ "${actual_version}" != "${expected_version}" ]]; then
+            echo "Expected '${expected_version}', got '${actual_version}'." >&2
+            exit 1
+          fi
+
+          package_name="virtiofsd-${VERSION}-${TARGET}"
+          archive="${package_name}.tar.gz"
+          package_dir="dist/${package_name}"
+
+          mkdir --parents "${package_dir}"
+          install --mode 0755 "${binary}" "${package_dir}/virtiofsd"
+          install --mode 0644 README.md LICENSE-APACHE LICENSE-BSD-3-Clause "${package_dir}/"
+          tar --directory dist --create --gzip --file "dist/${archive}" "${package_name}"
+
+          cd dist
+          sha256sum "${archive}" > "${archive}.sha256"
+
+          echo "archive=${archive}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Upload release assets
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Upload assets to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.release.tag_name }}
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          fail_on_unmatched_files: true
