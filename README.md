@@ -3,6 +3,10 @@
 A [virtio-fs](https://virtio-fs.gitlab.io/) vhost-user device daemon
 written in Rust.
 
+See [virtio-fs architecture and implementation](doc/virtiofs-architecture.md)
+for an end-to-end description of the guest, Virtio, vhost-user, virtiofsd,
+caching, and data paths.
+
 ## Building from sources
 
 ### Requirements
@@ -230,11 +234,46 @@ Maximum thread pool size. A value of "0" disables the pool.
 Default: 0.
 
 ```shell
+--num-request-queues <num-request-queues>
+```
+Number of virtio-fs request queues exposed by the backend. Valid values are
+1 through 63. Queue 0 remains the high-priority queue. With more than one
+request queue and no request thread pool, every high-priority/request queue is
+processed by its own vring worker. When a request thread pool is enabled, all
+queues submit work to that shared pool, whose size remains the execution
+concurrency limit.
+
+The backend must expose at least as many total queues as QEMU configures;
+otherwise QEMU rejects the vhost-user connection. A larger backend value is
+allowed but wastes workers and file descriptors, so matching daemon and QEMU
+values is recommended. Migration does not serialize this setting: source and
+destination QEMU queue topologies must be compatible, and each daemon must
+cover its corresponding QEMU configuration. Upstream Linux gained
+request-queue selection in 6.10 with commit
+[`529395d2ae6456`](https://github.com/torvalds/linux/commit/529395d2ae6456c556405016ea0c43081fe607f3),
+but distribution kernels can backport it, so the release number alone is not
+an authoritative capability check. A guest without that change normally still
+mounts the device, but sends ordinary requests only through `request[0]`; the
+additional request queues remain unused.
+
+Default: 1.
+
+See [Multiqueue design and implementation](doc/multiqueue.md) for protocol
+background, worker topology, locking, migration, and performance validation.
+
+```shell
 --rlimit-nofile <rlimit-nofile>
 ```
 Set maximum number of file descriptors.
 If the soft limit is greater than 1M  or `--rlimit-nofile=0`  is passed
 as parameter, the maximum number of file descriptors is not changed.
+
+The guest file-handle quota is calculated after reserving descriptors for
+memory slots and request execution. The default single-queue calculation is
+unchanged; extra request queues add reserves for their worker, eventfd, and
+direct-request concurrency costs. Increasing `--num-request-queues` therefore
+increases the required host FD budget. virtiofsd exits with an explicit error
+if that reserve overflows or does not fit within `RLIMIT_NOFILE`.
 
 Default: min(1000000, `/proc/sys/fs/nr_open`).
 
@@ -528,6 +567,28 @@ host# qemu-system \
 
 guest# mount -t virtiofs myfs /mnt
 ```
+
+Four-request-queue variant:
+
+```shell
+host# virtiofsd --socket-path=/tmp/vfsd.sock --shared-dir /mnt \
+        --inode-file-handles=mandatory --num-request-queues=4 &
+
+host# qemu-system \
+        -blockdev file,node-name=hdd,filename=<your image> \
+        -device virtio-blk,drive=hdd \
+        -chardev socket,id=char0,path=/tmp/vfsd.sock \
+        -device vhost-user-fs-pci,queue-size=1024,chardev=char0,tag=myfs,num-request-queues=4 \
+        -object memory-backend-memfd,id=mem,size=4G,share=on \
+        -numa node,memdev=mem \
+        -accel kvm -m 4G
+```
+
+Before relying on the extra queues, inspect the exact guest kernel source for
+`virtio_fs_map_queues` and `mq_map` in `fs/fuse/virtio_fs.c`, or run pinned
+parallel I/O and verify that the interrupt counters for more than one
+virtio-fs request queue increase. This runtime check also confirms that the
+queues are actually being used, not merely exposed by QEMU.
 
 See [FAQ](#faq) for adding virtiofs config to an existing qemu command-line.
 

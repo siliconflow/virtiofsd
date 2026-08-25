@@ -50,8 +50,6 @@ impl From<&PassthroughFs> for serialized::PassthroughFsV2 {
     /// Serialize `fs`, assuming it has been prepared for serialization (i.e. all inodes must have
     /// their migration info set)
     fn from(fs: &PassthroughFs) -> Self {
-        let handles_map = fs.handles.read().unwrap();
-
         let inodes: Vec<serialized::Inode> = fs.inodes.iter().map(|inode| {
             inode
                 .as_ref()
@@ -85,9 +83,11 @@ impl From<&PassthroughFs> for serialized::PassthroughFsV2 {
             HashMap::new()
         };
 
-        let handles = handles_map
-            .iter()
-            .map(|(handle, data)| (*handle, data.as_ref()).into())
+        let handles = fs
+            .handles
+            .snapshot()
+            .into_iter()
+            .map(|(handle, data)| (handle, data.as_ref()).into())
             .collect();
 
         serialized::PassthroughFsV2 {

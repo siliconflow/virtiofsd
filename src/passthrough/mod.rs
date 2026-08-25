@@ -6,6 +6,7 @@ pub mod credentials;
 pub mod device_state;
 pub mod file_handle;
 mod guest_fd_limit;
+mod handle_store;
 pub mod inode_store;
 pub mod mount_fd;
 pub mod read_only;
@@ -33,10 +34,10 @@ use crate::util::{other_io_error, ResultErrorContext};
 use crate::{fuse, oslib};
 use file_handle::{FileHandle, FileOrHandle, OpenableFileHandle};
 use guest_fd_limit::{GuestFdSemaphore, GuestFile};
+use handle_store::HandleStore;
 use mount_fd::{MPRError, MountFds};
 pub(crate) use stat::{statx, StatExt};
 use std::borrow::Cow;
-use std::collections::{btree_map, BTreeMap};
 use std::convert::TryInto;
 use std::ffi::{CStr, CString};
 use std::fs::File;
@@ -500,7 +501,7 @@ pub struct PassthroughFs {
 
     // File descriptors for open files and directories. Unlike the fds in `inodes`, these _can_ be
     // used for reading and writing data.
-    handles: RwLock<BTreeMap<Handle, Arc<HandleData>>>,
+    handles: HandleStore<Arc<HandleData>>,
     next_handle: AtomicU64,
 
     // Represents a limit for the number of file descriptors we allow allocating for the guest.
@@ -602,7 +603,7 @@ impl PassthroughFs {
         let mut fs = PassthroughFs {
             inodes: Default::default(),
             next_inode: AtomicU64::new(fuse::ROOT_ID + 1),
-            handles: RwLock::new(BTreeMap::new()),
+            handles: HandleStore::default(),
             next_handle: AtomicU64::new(0),
             guest_fds: Arc::new(GuestFdSemaphore::new(cfg.guest_fd_limit)),
             mount_fds,
@@ -664,11 +665,8 @@ impl PassthroughFs {
 
     fn find_handle(&self, handle: Handle, inode: Inode) -> io::Result<Arc<HandleData>> {
         self.handles
-            .read()
-            .unwrap()
-            .get(&handle)
+            .get(handle)
             .filter(|hd| hd.inode == inode)
-            .cloned()
             .ok_or_else(ebadf)
     }
 
@@ -1028,7 +1026,7 @@ impl PassthroughFs {
             migration_info: HandleMigrationInfo::new(flags as i32),
         };
 
-        self.handles.write().unwrap().insert(handle, Arc::new(data));
+        self.handles.insert(handle, Arc::new(data));
 
         let mut opts = OpenOptions::empty();
         match self.cfg.cache_policy {
@@ -1057,15 +1055,13 @@ impl PassthroughFs {
     }
 
     fn do_release(&self, inode: Inode, handle: Handle) -> io::Result<()> {
-        let mut handles = self.handles.write().unwrap();
-
-        if let btree_map::Entry::Occupied(e) = handles.entry(handle) {
-            if e.get().inode == inode {
-                // We don't need to close the file here because that will happen automatically when
-                // the last `Arc` is dropped.
-                e.remove();
-                return Ok(());
-            }
+        if self
+            .handles
+            .remove_if(handle, |handle_data| handle_data.inode == inode)
+        {
+            // We don't need to close the file here because that will happen automatically when
+            // the last `Arc` is dropped.
+            return Ok(());
         }
 
         Err(ebadf())
@@ -1659,7 +1655,10 @@ impl FileSystem for PassthroughFs {
     }
 
     fn destroy(&self) {
-        self.handles.write().unwrap().clear();
+        // A device reset may cancel an in-progress migration preparation.  Do not carry its
+        // change-tracking mode into the next FUSE session after the inode store is cleared.
+        self.track_migration_info.store(false, Ordering::Relaxed);
+        self.handles.clear();
         self.inodes.clear();
         self.writeback.store(false, Ordering::Relaxed);
         self.announce_submounts.store(false, Ordering::Relaxed);
@@ -1869,7 +1868,7 @@ impl FileSystem for PassthroughFs {
                     migration_info: HandleMigrationInfo::new(flags as i32),
                 };
 
-                self.handles.write().unwrap().insert(handle, Arc::new(data));
+                self.handles.insert(handle, Arc::new(data));
 
                 (entry, handle)
             }
@@ -2786,6 +2785,21 @@ impl From<GuestFile> for HandleDataFile {
 mod tests {
     use super::*;
     use vmm_sys_util::tempdir::TempDir;
+
+    #[test]
+    fn destroy_stops_migration_change_tracking() {
+        let shared_dir = TempDir::new_with_prefix("/tmp/virtiofsd_test_").unwrap();
+        let fs = PassthroughFs::new(Config {
+            root_dir: shared_dir.as_path().to_string_lossy().into_owned(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        fs.track_migration_info.store(true, Ordering::Relaxed);
+        fs.destroy();
+
+        assert!(!fs.track_migration_info.load(Ordering::Relaxed));
+    }
 
     #[test]
     fn create_write_only_with_writeback_opens_read_write() {

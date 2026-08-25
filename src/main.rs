@@ -12,7 +12,7 @@ use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use std::{cmp, env, process};
+use std::{env, process};
 use virtiofsd::idmap::{GidMap, UidMap};
 
 use clap::{CommandFactory, Parser};
@@ -30,7 +30,9 @@ use virtiofsd::passthrough::{
 use virtiofsd::sandbox::{Sandbox, SandboxMode};
 use virtiofsd::seccomp::{enable_seccomp, SeccompAction};
 use virtiofsd::util::write_pid_file;
-use virtiofsd::vhost_user::{Error, VhostUserFsBackendBuilder, MAX_TAG_LEN};
+use virtiofsd::vhost_user::{
+    Error, VhostUserFsBackendBuilder, DEFAULT_REQUEST_QUEUES, MAX_REQUEST_QUEUES, MAX_TAG_LEN,
+};
 use virtiofsd::{limits, oslib, soft_idmap};
 use vm_memory::{GuestMemoryAtomic, GuestMemoryMmap};
 
@@ -44,12 +46,17 @@ const MAX_MEM_SLOTS: u64 = 509;
 /// The exact value has been chosen mostly arbitrarily, but we know we need one FD per shared
 /// memory area, which is where the `MAX_MEM_SLOTS` comes from.
 ///
-/// Given how allocating FD towards the guest quota works, we also need to add one FD per thread in
-/// our pool: FDs are created first, and only then accounted for.  All threads must be able to
-/// simultaneously create an FD and then have it be accounted for, so we need to make room for as
-/// many additional FDs as there are threads in the pool.  The thread pool size is set at runtime,
-/// though, so cannot be taken into account here, but instead where this constant is used.
+/// Queue, worker, and request-concurrency reserves are runtime-dependent and are added by
+/// `internal_fd_reserve()`.
 const INTERNAL_FD_RESERVE: u64 = MAX_MEM_SLOTS + 100;
+
+/// Each vring worker owns one epoll FD and an exit event represented by two FD handles.
+const FDS_PER_VRING_WORKER: u64 = 3;
+
+/// An additional virtqueue can own kick, call, and error event FDs received from the frontend,
+/// plus a retained cloned kick notifier while a lifecycle pause defers the queue.  Reserve one
+/// more for the transient clone made before an existing deferred notifier is replaced.
+const FDS_PER_VIRTQUEUE: u64 = 5;
 
 type Result<T> = std::result::Result<T, Error>;
 
@@ -112,6 +119,52 @@ fn parse_tag(tag: &str) -> Result<String> {
     }
 }
 
+fn parse_num_request_queues(value: &str) -> std::result::Result<u16, String> {
+    let count = value
+        .parse::<u16>()
+        .map_err(|error| format!("invalid request queue count: {error}"))?;
+
+    if (DEFAULT_REQUEST_QUEUES..=MAX_REQUEST_QUEUES).contains(&count) {
+        Ok(count)
+    } else {
+        Err(format!(
+            "request queue count must be between {DEFAULT_REQUEST_QUEUES} and \
+             {MAX_REQUEST_QUEUES}"
+        ))
+    }
+}
+
+/// Calculate the FD budget that must remain unavailable to guest file handles.
+///
+/// Preserve the historical reserve exactly for the default one-request-queue topology.  For
+/// multiqueue direct mode, each additional worker can create one guest FD before charging it, just
+/// like the original direct worker.  Additional queue and worker infrastructure also owns FDs
+/// outside the guest quota.  Request-pool concurrency is unchanged by the number of queues, so it
+/// needs no multiqueue request-concurrency increment.
+fn internal_fd_reserve(thread_pool_size: usize, num_request_queues: u16) -> Option<u64> {
+    let baseline_request_reserve = u64::try_from(thread_pool_size).ok()?.max(1);
+    let additional_request_queues =
+        u64::from(num_request_queues.checked_sub(DEFAULT_REQUEST_QUEUES)?);
+    let additional_workers = if num_request_queues == DEFAULT_REQUEST_QUEUES {
+        0
+    } else {
+        // Multiqueue has one worker per queue instead of one shared worker.  With N request queues
+        // this adds N workers (the total changes from one to N+1).
+        u64::from(num_request_queues)
+    };
+    let additional_direct_requests = if thread_pool_size == 0 {
+        additional_workers
+    } else {
+        0
+    };
+
+    INTERNAL_FD_RESERVE
+        .checked_add(baseline_request_reserve)?
+        .checked_add(additional_workers.checked_mul(FDS_PER_VRING_WORKER)?)?
+        .checked_add(additional_direct_requests)?
+        .checked_add(additional_request_queues.checked_mul(FDS_PER_VIRTQUEUE)?)
+}
+
 #[derive(Clone, Debug, Parser)]
 #[command(
     name = "virtiofsd",
@@ -156,6 +209,14 @@ struct Opt {
     /// Maximum thread pool size. A value of "0" disables the pool
     #[arg(long, default_value = "0")]
     thread_pool_size: usize,
+
+    /// Number of request queues exposed by the vhost-user backend
+    #[arg(
+        long,
+        default_value_t = DEFAULT_REQUEST_QUEUES,
+        value_parser = parse_num_request_queues
+    )]
+    num_request_queues: u16,
 
     /// Enable support for extended attributes
     #[arg(long)]
@@ -715,6 +776,7 @@ fn main() {
         || opt.security_label != NegotiationMode::Never
         || opt.xattr;
     let thread_pool_size = opt.thread_pool_size;
+    let num_request_queues = opt.num_request_queues;
     let readdirplus = match opt.cache {
         CachePolicy::Never => false,
         _ => !opt.no_readdirplus,
@@ -805,9 +867,16 @@ fn main() {
         process::exit(1)
     });
 
-    // Account for guest FDs that are created first and only accounted for then (see doc comment on
-    // `INTERNAL_FD_RESERVE`
-    let internal_fd_reserve = INTERNAL_FD_RESERVE + cmp::max(opt.thread_pool_size as u64, 1);
+    // Account for queue/worker infrastructure and guest FDs that are created before being charged
+    // to the guest quota (see `internal_fd_reserve()`).
+    let internal_fd_reserve = internal_fd_reserve(thread_pool_size, num_request_queues)
+        .unwrap_or_else(|| {
+            error!(
+                "File descriptor reserve overflows for thread pool size {} and {} request queues",
+                thread_pool_size, num_request_queues
+            );
+            process::exit(1)
+        });
     let guest_fd_limit = fd_count_limit.checked_sub(internal_fd_reserve).unwrap_or_else(|| {
         error!("Maximum number of file descriptors too small: Limit is {fd_count_limit}, must be at least {internal_fd_reserve}");
         process::exit(1)
@@ -886,13 +955,13 @@ fn main() {
             error!("Failed to create internal filesystem representation: {e}");
             process::exit(1);
         });
-        run_generic_fs(fs, listener, thread_pool_size, opt.tag);
+        run_generic_fs(fs, listener, thread_pool_size, num_request_queues, opt.tag);
     } else {
         let fs = PassthroughFs::new(fs_cfg).unwrap_or_else(|e| {
             error!("Failed to create internal filesystem representation: {e}");
             process::exit(1);
         });
-        run_generic_fs(fs, listener, thread_pool_size, opt.tag);
+        run_generic_fs(fs, listener, thread_pool_size, num_request_queues, opt.tag);
     }
 }
 
@@ -901,11 +970,13 @@ fn run_generic_fs<F: FileSystem + SerializableFileSystem + Send + Sync + 'static
     fs: F,
     mut listener: Listener,
     thread_pool_size: usize,
+    num_request_queues: u16,
     tag: Option<String>,
 ) {
     let fs_backend = Arc::new(
         VhostUserFsBackendBuilder::default()
             .set_thread_pool_size(thread_pool_size)
+            .set_num_request_queues(num_request_queues)
             .set_tag(tag)
             .build(fs)
             .unwrap_or_else(|error| {
@@ -935,5 +1006,61 @@ fn run_generic_fs<F: FileSystem + SerializableFileSystem + Send + Sync + 'static
             HandleRequest(Disconnected) => info!("Client disconnected, shutting down"),
             _ => error!("Waiting for daemon failed: {e:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_request_queue_count_range() {
+        assert_eq!(parse_num_request_queues("1"), Ok(1));
+        assert_eq!(parse_num_request_queues("63"), Ok(63));
+        assert!(parse_num_request_queues("0").is_err());
+        assert!(parse_num_request_queues("64").is_err());
+        assert!(parse_num_request_queues("not-a-number").is_err());
+    }
+
+    #[test]
+    fn parses_request_queue_count_from_cli() {
+        let opt = Opt::try_parse_from([
+            "virtiofsd",
+            "--print-capabilities",
+            "--num-request-queues=4",
+        ])
+        .unwrap();
+        assert_eq!(opt.num_request_queues, 4);
+
+        assert!(Opt::try_parse_from([
+            "virtiofsd",
+            "--print-capabilities",
+            "--num-request-queues=0",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn reserves_fds_for_default_queue_topology() {
+        assert_eq!(internal_fd_reserve(0, 1), Some(INTERNAL_FD_RESERVE + 1));
+        assert_eq!(internal_fd_reserve(8, 1), Some(INTERNAL_FD_RESERVE + 8));
+    }
+
+    #[test]
+    fn reserves_fds_for_multiqueue_workers_and_request_concurrency() {
+        assert_eq!(
+            internal_fd_reserve(0, 4),
+            Some(INTERNAL_FD_RESERVE + 1 + 4 * FDS_PER_VRING_WORKER + 4 + 3 * FDS_PER_VIRTQUEUE)
+        );
+        assert_eq!(
+            internal_fd_reserve(8, 4),
+            Some(INTERNAL_FD_RESERVE + 8 + 4 * FDS_PER_VRING_WORKER + 3 * FDS_PER_VIRTQUEUE)
+        );
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn rejects_overflowing_fd_reserve() {
+        assert_eq!(internal_fd_reserve(usize::MAX, MAX_REQUEST_QUEUES), None);
     }
 }
