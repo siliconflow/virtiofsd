@@ -22,7 +22,7 @@ use crate::passthrough::{
     NegotiationMode, PassthroughFs,
 };
 use crate::util::{other_io_error, ErrorContext, ResultErrorContext};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::convert::{TryFrom, TryInto};
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -137,7 +137,7 @@ impl serialized::PassthroughFsV1 {
         fs.next_inode.store(self.next_inode, Ordering::Relaxed);
 
         // Reconstruct handles (i.e., open those files)
-        *fs.handles.write().unwrap() = BTreeMap::new();
+        fs.handles.clear();
         for handle in self.handles {
             handle.deserialize_with_fs(fs)?;
         }
@@ -528,10 +528,7 @@ impl serialized::Handle {
             file_type: FileType::from_mode(inode.mode),
             migration_info,
         };
-        fs.handles
-            .write()
-            .unwrap()
-            .insert(self.id, Arc::new(handle_data));
+        fs.handles.insert(self.id, Arc::new(handle_data));
         Ok(())
     }
 }
